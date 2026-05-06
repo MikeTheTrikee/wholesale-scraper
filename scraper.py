@@ -1,13 +1,11 @@
 """
-Manatee County Probate Lead Scraper - Fixed Version
------------------------------------------------------
-Scrapes probate cases from Manatee County Clerk records,
-enriches with property data from Manatee Property Appraiser,
-and pushes leads to Supabase CRM.
-
-Usage:
-  python scraper.py --start 2026-04-01 --end 2026-05-05   (initial bulk load)
-  python scraper.py                                         (daily: yesterday to today)
+Manatee County Probate Lead Scraper v3
+----------------------------------------
+Fixed to match actual HTML structure of records.manateeclerk.com
+- Table id="results-table", rows class="data-row"
+- Case number is plain text in td[1], no hyperlink
+- Eye icon button contains the link to case detail
+- Case detail URL built as /CourtRecords/Case/{caseNumber}
 """
 
 import requests
@@ -42,11 +40,11 @@ def sb_headers():
     }
 
 def lead_exists(case_number):
-    resp = requests.get(
-        f"{SUPABASE_URL}/rest/v1/leads?case_number=eq.{quote(case_number)}&select=id",
-        headers=sb_headers()
-    )
     try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/leads?case_number=eq.{quote(case_number)}&select=id",
+            headers=sb_headers()
+        )
         return len(resp.json()) > 0
     except:
         return False
@@ -58,10 +56,10 @@ def insert_lead(lead):
         json=lead
     )
     if resp.status_code in (200, 201):
-        print(f"  ✅ Inserted: {lead.get('address', 'Unknown')} — {lead.get('owner', '')}")
+        print(f"  ✅ {lead.get('address','?')} — {lead.get('owner','')}")
         return True
     else:
-        print(f"  ❌ Failed {resp.status_code}: {resp.text[:200]}")
+        print(f"  ❌ Insert failed {resp.status_code}: {resp.text[:150]}")
         return False
 
 # ── SEARCH PAGE ───────────────────────────────────────────────────────────────
@@ -70,7 +68,7 @@ def fetch_search_page(start_date, end_date, page=1):
         f"{BASE_URL}/CourtRecords/Search/CaseType/{page}/25"
         f"/{start_date}/{end_date}?caseTypeId=17&filingTypeId=0"
     )
-    print(f"  Fetching page {page}: {url}")
+    print(f"  Fetching page {page}...")
     try:
         time.sleep(DELAY)
         resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -81,43 +79,76 @@ def fetch_search_page(start_date, end_date, page=1):
         return None
 
 def parse_search_page(html):
+    """
+    Parse the results table.
+    Table id='results-table', rows class='data-row'
+    Columns: [0]=row#, [1]=case_number(text), [2]=party_name, [3]=party_type,
+             [4]=case_type, [5]=case_status, [6]=file_date, [7]=DOB
+    Eye icon link is in an earlier td (View column) — but case number
+    is plain text so we build the detail URL ourselves.
+    """
     soup = BeautifulSoup(html, "html.parser")
     cases = []
 
+    # Total count
     total = 0
-    for text in soup.stripped_strings:
-        m = re.search(r"Matching Results:\s*(\d+)", text)
-        if m:
-            total = int(m.group(1))
-            break
+    match = re.search(r"Matching Results:\s*(\d+)", html)
+    if match:
+        total = int(match.group(1))
 
-    rows = soup.select("table tr")
+    # Find results table
+    table = soup.find("table", {"id": "results-table"})
+    if not table:
+        # Fallback: any table with data-row class rows
+        table = soup.find("table")
+
+    if not table:
+        print("  ⚠️  No table found on page")
+        return cases, total
+
+    rows = table.find_all("tr", class_="data-row")
+    if not rows:
+        # Fallback: all tr elements
+        rows = table.find_all("tr")
+
+    print(f"  Found {len(rows)} rows")
+
     for row in rows:
         cells = row.find_all("td")
-        if len(cells) < 4:
+        if len(cells) < 6:
             continue
 
-        link_tag = row.find("a", href=True)
-        if not link_tag:
-            continue
+        # Based on inspector: td[0]=row#, td[1]=case_number, td[2]=party_name
+        # td[3]=party_type, td[4]=case_type, td[5]=case_status, td[6]=file_date
+        # First cell might be the eye icon/view button — check which cell has the case number
 
-        href = link_tag.get("href", "")
-        if "/CourtRecords/Case/" not in href:
-            continue
+        case_number = ""
+        party_name = ""
+        party_type = ""
+        case_status = ""
+        file_date = ""
 
-        # Extract case number directly from URL
-        case_number = href.split("/CourtRecords/Case/")[-1].strip().split("?")[0].strip("/")
+        for idx, cell in enumerate(cells):
+            text = cell.get_text(strip=True)
+            # Case numbers match pattern like 2026CP000726AX
+            if re.match(r'^\d{4}[A-Z]{2}\d{6}[A-Z]{2}$', text):
+                case_number = text
+                party_name = cells[idx+1].get_text(strip=True) if idx+1 < len(cells) else ""
+                party_type = cells[idx+2].get_text(strip=True) if idx+2 < len(cells) else ""
+                case_status = cells[idx+4].get_text(strip=True) if idx+4 < len(cells) else ""
+                file_date = cells[idx+5].get_text(strip=True) if idx+5 < len(cells) else ""
+                break
+
         if not case_number:
             continue
 
-        party_name = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-        case_status = cells[5].get_text(strip=True) if len(cells) > 5 else ""
-        file_date = cells[6].get_text(strip=True) if len(cells) > 6 else ""
+        # Build detail URL directly from case number
+        detail_url = f"{BASE_URL}/CourtRecords/Case/{case_number}"
 
         cases.append({
             "case_number": case_number,
-            "case_url": BASE_URL + href,
-            "decedent_name": party_name,
+            "case_url": detail_url,
+            "decedent_name": party_name if "Decedent" in party_type else party_name,
             "case_status": case_status,
             "file_date": file_date,
         })
@@ -127,7 +158,7 @@ def parse_search_page(html):
 # ── CASE DETAIL ───────────────────────────────────────────────────────────────
 def fetch_case_detail(case_number, case_url=None):
     url = case_url or f"{BASE_URL}/CourtRecords/Case/{case_number}"
-    print(f"    → {url}")
+    print(f"    → {case_number} ({url})")
     try:
         time.sleep(DELAY)
         resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -148,14 +179,13 @@ def parse_case_detail(html, case_number):
         "petitioner_name": "",
         "petitioner_physical": "",
         "petitioner_mailing": "",
-        "file_date": "",
     }
 
-    # Find parties table
+    # Find parties section — look for table containing Decedent/Petitioner
     parties_table = None
     for table in soup.find_all("table"):
-        txt = table.get_text()
-        if "Decedent" in txt or "Petitioner" in txt:
+        text = table.get_text()
+        if "Decedent" in text or "Petitioner" in text:
             parties_table = table
             break
 
@@ -166,32 +196,35 @@ def parse_case_detail(html, case_number):
     current_type = ""
     for row in parties_table.find_all("tr"):
         cells = row.find_all("td")
+        if not cells:
+            continue
+
+        # Party type is in first cell
+        pt = cells[0].get_text(strip=True)
+        if pt and len(pt) < 50:
+            current_type = pt
+
         if len(cells) < 2:
             continue
 
-        pt = cells[0].get_text(strip=True)
-        if pt:
-            current_type = pt
-
         name_cell = cells[1]
-        lines = [l.strip() for l in name_cell.get_text("\n", strip=True).split("\n") if l.strip()]
+        raw = name_cell.get_text("\n", strip=True)
+        lines = [l.strip() for l in raw.split("\n") if l.strip()]
 
         if not lines:
             continue
 
-        # First line is the name
         name = lines[0]
-
-        # Parse addresses
         mailing = ""
         physical = ""
+
         for j, line in enumerate(lines):
             if "Mailing Address:" in line:
-                addr = line.replace("Mailing Address:", "").strip()
-                mailing = addr if addr else (lines[j+1] if j+1 < len(lines) else "")
+                val = line.replace("Mailing Address:", "").strip()
+                mailing = val if val else (lines[j+1] if j+1 < len(lines) else "")
             elif "Physical Address:" in line:
-                addr = line.replace("Physical Address:", "").strip()
-                physical = addr if addr else (lines[j+1] if j+1 < len(lines) else "")
+                val = line.replace("Physical Address:", "").strip()
+                physical = val if val else (lines[j+1] if j+1 < len(lines) else "")
 
         if "Decedent" in current_type and not detail["decedent_name"]:
             detail["decedent_name"] = name
@@ -213,13 +246,13 @@ def get_property_data(address):
     street = re.sub(
         r',?\s*(PALMETTO|BRADENTON|SARASOTA|PARRISH|ELLENTON|ANNA MARIA|HOLMES BEACH|LONGBOAT KEY|TERRA CEIA|MYAKKA CITY|ONECO|CORTEZ|MEMPHIS|TALLEVAST).*$',
         '', address, flags=re.I
-    ).strip()
-    street = re.sub(r'\s+FL\s+\d{5}.*$', '', street, flags=re.I).strip().strip(",")
+    ).strip().strip(",").strip()
+    street = re.sub(r'\s+FL\s+\d{5}.*$', '', street, flags=re.I).strip()
 
-    if not street:
+    if not street or len(street) < 4:
         return {}
 
-    print(f"    🏠 PAO lookup: {street}")
+    print(f"    🏠 PAO: {street}")
     try:
         resp = requests.get(
             f"https://www.manateepao.gov/search/?s={quote(street)}",
@@ -252,28 +285,31 @@ def get_property_data(address):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run_scraper(start_date, end_date):
     print(f"\n{'='*60}")
-    print(f"Manatee Probate Scraper v2")
+    print(f"Manatee Probate Scraper v3")
     print(f"Range: {start_date} → {end_date}")
     print(f"{'='*60}\n")
 
     html = fetch_search_page(start_date, end_date, page=1)
     if not html:
-        print("Could not fetch first page. Exiting.")
+        print("Could not fetch page 1. Exiting.")
         return
 
     cases, total = parse_search_page(html)
     pages = max(1, (total + 24) // 25)
-    print(f"Total: {total} cases, {pages} pages\n")
+    print(f"Total: {total} cases across {pages} pages")
+    print(f"Page 1: {len(cases)} cases parsed\n")
 
     all_cases = list(cases)
+
     for page in range(2, pages + 1):
         html = fetch_search_page(start_date, end_date, page=page)
         if html:
             pc, _ = parse_search_page(html)
             all_cases.extend(pc)
-            print(f"  Page {page}: +{len(pc)}")
+            print(f"  Page {page}: +{len(pc)} cases")
 
-    print(f"\nTotal collected: {len(all_cases)}\n")
+    print(f"\nTotal collected: {len(all_cases)}")
+    print("Processing details...\n")
 
     inserted = skipped = errors = 0
 
@@ -282,7 +318,7 @@ def run_scraper(start_date, end_date):
         print(f"\n[{i+1}/{len(all_cases)}] {cn} — {case.get('decedent_name','')}")
 
         if lead_exists(cn):
-            print(f"  ⏭️  Skipping duplicate")
+            print(f"  ⏭️  Already exists")
             skipped += 1
             continue
 
@@ -340,7 +376,7 @@ def run_scraper(start_date, end_date):
             errors += 1
 
     print(f"\n{'='*60}")
-    print(f"COMPLETE — Inserted: {inserted} | Skipped: {skipped} | Errors: {errors}")
+    print(f"DONE — Inserted: {inserted} | Skipped: {skipped} | Errors: {errors}")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
