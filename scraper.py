@@ -1,11 +1,9 @@
 """
-Manatee County Probate Lead Scraper v3
+Manatee County Probate Lead Scraper v4
 ----------------------------------------
-Fixed to match actual HTML structure of records.manateeclerk.com
-- Table id="results-table", rows class="data-row"
-- Case number is plain text in td[1], no hyperlink
-- Eye icon button contains the link to case detail
-- Case detail URL built as /CourtRecords/Case/{caseNumber}
+FIXED: Site uses POST form with internal caseId, not GET URL.
+Each row has a hidden input caseId (e.g. 2640903) and a CSRF token.
+We POST to /CourtRecords/Case/Details with those values.
 """
 
 import requests
@@ -19,7 +17,6 @@ from urllib.parse import quote
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://siglipinabgwgwujvatm.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNpZ2xpcGluYWJnd2d3dWp2YXRtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5OTc5ODksImV4cCI6MjA5MzU3Mzk4OX0._J1P82_oLycZU--Fv7pHPQU4AfC9__FMG9aBukDS6vs"
-
 BASE_URL = "https://records.manateeclerk.com"
 DELAY = 3
 
@@ -27,7 +24,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://records.manateeclerk.com/",
 }
 
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
@@ -59,8 +55,12 @@ def insert_lead(lead):
         print(f"  ✅ {lead.get('address','?')} — {lead.get('owner','')}")
         return True
     else:
-        print(f"  ❌ Insert failed {resp.status_code}: {resp.text[:150]}")
+        print(f"  ❌ {resp.status_code}: {resp.text[:150]}")
         return False
+
+# ── SESSION ───────────────────────────────────────────────────────────────────
+session = requests.Session()
+session.headers.update(HEADERS)
 
 # ── SEARCH PAGE ───────────────────────────────────────────────────────────────
 def fetch_search_page(start_date, end_date, page=1):
@@ -71,84 +71,75 @@ def fetch_search_page(start_date, end_date, page=1):
     print(f"  Fetching page {page}...")
     try:
         time.sleep(DELAY)
-        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp = session.get(url, timeout=20)
         resp.raise_for_status()
-        return resp.text
+        return resp.text, url
     except Exception as e:
-        print(f"  ⚠️  Page {page} error: {e}")
-        return None
+        print(f"  ⚠️  Error: {e}")
+        return None, url
 
 def parse_search_page(html):
     """
-    Parse the results table.
-    Table id='results-table', rows class='data-row'
-    Columns: [0]=row#, [1]=case_number(text), [2]=party_name, [3]=party_type,
-             [4]=case_type, [5]=case_status, [6]=file_date, [7]=DOB
-    Eye icon link is in an earlier td (View column) — but case number
-    is plain text so we build the detail URL ourselves.
+    Parse data-row rows. Each row has:
+    - td[0]: row number
+    - td[1]: form with hidden caseId input + CSRF token
+    - td[2]: case number (plain text)
+    - td[3]: party name
+    - td[4]: party type
+    - td[5]: case type
+    - td[6]: case status
+    - td[7]: file date
+    - td[8]: DOB
     """
     soup = BeautifulSoup(html, "html.parser")
     cases = []
 
-    # Total count
     total = 0
-    match = re.search(r"Matching Results:\s*(\d+)", html)
-    if match:
-        total = int(match.group(1))
+    m = re.search(r"Matching Results:\s*(\d+)", html)
+    if m:
+        total = int(m.group(1))
 
-    # Find results table
-    table = soup.find("table", {"id": "results-table"})
-    if not table:
-        # Fallback: any table with data-row class rows
-        table = soup.find("table")
-
-    if not table:
-        print("  ⚠️  No table found on page")
-        return cases, total
-
-    rows = table.find_all("tr", class_="data-row")
-    if not rows:
-        # Fallback: all tr elements
-        rows = table.find_all("tr")
-
-    print(f"  Found {len(rows)} rows")
+    rows = soup.find_all("tr", class_="data-row")
+    print(f"  Found {len(rows)} data-row entries")
 
     for row in rows:
         cells = row.find_all("td")
-        if len(cells) < 6:
+        if len(cells) < 7:
             continue
 
-        # Based on inspector: td[0]=row#, td[1]=case_number, td[2]=party_name
-        # td[3]=party_type, td[4]=case_type, td[5]=case_status, td[6]=file_date
-        # First cell might be the eye icon/view button — check which cell has the case number
-
-        case_number = ""
-        party_name = ""
-        party_type = ""
-        case_status = ""
-        file_date = ""
-
-        for idx, cell in enumerate(cells):
-            text = cell.get_text(strip=True)
-            # Case numbers match pattern like 2026CP000726AX
-            if re.match(r'^\d{4}[A-Z]{2}\d{6}[A-Z]{2}$', text):
-                case_number = text
-                party_name = cells[idx+1].get_text(strip=True) if idx+1 < len(cells) else ""
-                party_type = cells[idx+2].get_text(strip=True) if idx+2 < len(cells) else ""
-                case_status = cells[idx+4].get_text(strip=True) if idx+4 < len(cells) else ""
-                file_date = cells[idx+5].get_text(strip=True) if idx+5 < len(cells) else ""
-                break
-
-        if not case_number:
+        # Extract caseId and CSRF token from the form in td[1]
+        form = cells[1].find("form")
+        if not form:
             continue
 
-        # Build detail URL directly from case number
-        detail_url = f"{BASE_URL}/CourtRecords/Case/{case_number}"
+        csrf_input = form.find("input", {"name": "__RequestVerificationToken"})
+        caseid_input = form.find("input", {"name": "caseId"})
+        search_addr_input = form.find("input", {"name": "searchAddress"})
+
+        if not caseid_input:
+            continue
+
+        case_id = caseid_input.get("value", "")
+        csrf_token = csrf_input.get("value", "") if csrf_input else ""
+        search_addr = search_addr_input.get("value", "") if search_addr_input else ""
+
+        # Case number from td[2]
+        case_number = cells[2].get_text(strip=True)
+        party_name = cells[3].get_text(strip=True) if len(cells) > 3 else ""
+        party_type = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+        case_status = cells[6].get_text(strip=True) if len(cells) > 6 else ""
+        file_date = cells[7].get_text(strip=True) if len(cells) > 7 else ""
+
+        if not case_number or not case_id:
+            continue
 
         cases.append({
             "case_number": case_number,
-            "case_url": detail_url,
-            "decedent_name": party_name if "Decedent" in party_type else party_name,
+            "case_id": case_id,
+            "csrf_token": csrf_token,
+            "search_addr": search_addr,
+            "decedent_name": party_name,
+            "party_type": party_type,
             "case_status": case_status,
             "file_date": file_date,
         })
@@ -156,16 +147,33 @@ def parse_search_page(html):
     return cases, total
 
 # ── CASE DETAIL ───────────────────────────────────────────────────────────────
-def fetch_case_detail(case_number, case_url=None):
-    url = case_url or f"{BASE_URL}/CourtRecords/Case/{case_number}"
-    print(f"    → {case_number} ({url})")
+def fetch_case_detail(case_info, search_page_url):
+    """POST to case details endpoint using caseId and CSRF token."""
+    post_url = f"{BASE_URL}/CourtRecords/Case/Details"
+    case_number = case_info["case_number"]
+    
+    post_data = {
+        "__RequestVerificationToken": case_info["csrf_token"],
+        "caseId": case_info["case_id"],
+        "searchAddress": case_info.get("search_addr", search_page_url),
+    }
+
+    print(f"    → POST case {case_number} (id={case_info['case_id']})")
     try:
         time.sleep(DELAY)
-        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp = session.post(
+            post_url,
+            data=post_data,
+            headers={
+                "Referer": search_page_url,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=20
+        )
         resp.raise_for_status()
         return parse_case_detail(resp.text, case_number)
     except Exception as e:
-        print(f"    ⚠️  Error: {e}")
+        print(f"    ⚠️  POST error: {e}")
         return {}
 
 def parse_case_detail(html, case_number):
@@ -181,11 +189,11 @@ def parse_case_detail(html, case_number):
         "petitioner_mailing": "",
     }
 
-    # Find parties section — look for table containing Decedent/Petitioner
+    # Find parties table
     parties_table = None
     for table in soup.find_all("table"):
-        text = table.get_text()
-        if "Decedent" in text or "Petitioner" in text:
+        txt = table.get_text()
+        if "Decedent" in txt or "Petitioner" in txt:
             parties_table = table
             break
 
@@ -199,17 +207,15 @@ def parse_case_detail(html, case_number):
         if not cells:
             continue
 
-        # Party type is in first cell
         pt = cells[0].get_text(strip=True)
-        if pt and len(pt) < 50:
+        if pt and len(pt) < 60:
             current_type = pt
 
         if len(cells) < 2:
             continue
 
         name_cell = cells[1]
-        raw = name_cell.get_text("\n", strip=True)
-        lines = [l.strip() for l in raw.split("\n") if l.strip()]
+        lines = [l.strip() for l in name_cell.get_text("\n", strip=True).split("\n") if l.strip()]
 
         if not lines:
             continue
@@ -230,7 +236,6 @@ def parse_case_detail(html, case_number):
             detail["decedent_name"] = name
             detail["decedent_physical"] = physical
             detail["decedent_mailing"] = mailing
-
         elif "Petitioner" in current_type and not detail["petitioner_name"]:
             detail["petitioner_name"] = name
             detail["petitioner_physical"] = physical
@@ -254,9 +259,9 @@ def get_property_data(address):
 
     print(f"    🏠 PAO: {street}")
     try:
-        resp = requests.get(
+        resp = session.get(
             f"https://www.manateepao.gov/search/?s={quote(street)}",
-            headers={**HEADERS, "Referer": "https://www.manateepao.gov/"},
+            headers={"Referer": "https://www.manateepao.gov/"},
             timeout=12
         )
         if resp.status_code != 200:
@@ -285,31 +290,31 @@ def get_property_data(address):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run_scraper(start_date, end_date):
     print(f"\n{'='*60}")
-    print(f"Manatee Probate Scraper v3")
+    print(f"Manatee Probate Scraper v4")
     print(f"Range: {start_date} → {end_date}")
     print(f"{'='*60}\n")
 
-    html = fetch_search_page(start_date, end_date, page=1)
+    html, page1_url = fetch_search_page(start_date, end_date, page=1)
     if not html:
-        print("Could not fetch page 1. Exiting.")
+        print("Could not fetch page 1.")
         return
 
     cases, total = parse_search_page(html)
     pages = max(1, (total + 24) // 25)
-    print(f"Total: {total} cases across {pages} pages")
-    print(f"Page 1: {len(cases)} cases parsed\n")
+    print(f"Total: {total} cases, {pages} pages. Page 1: {len(cases)} parsed.\n")
 
     all_cases = list(cases)
+    page_urls = {1: page1_url}
 
     for page in range(2, pages + 1):
-        html = fetch_search_page(start_date, end_date, page=page)
+        html, purl = fetch_search_page(start_date, end_date, page=page)
         if html:
             pc, _ = parse_search_page(html)
             all_cases.extend(pc)
-            print(f"  Page {page}: +{len(pc)} cases")
+            page_urls[page] = purl
+            print(f"  Page {page}: +{len(pc)}")
 
-    print(f"\nTotal collected: {len(all_cases)}")
-    print("Processing details...\n")
+    print(f"\nTotal collected: {len(all_cases)}\nProcessing...\n")
 
     inserted = skipped = errors = 0
 
@@ -322,7 +327,7 @@ def run_scraper(start_date, end_date):
             skipped += 1
             continue
 
-        detail = fetch_case_detail(cn, case.get("case_url"))
+        detail = fetch_case_detail(case, page1_url)
         if not detail:
             errors += 1
             continue
@@ -331,7 +336,6 @@ def run_scraper(start_date, end_date):
         owner = detail.get("decedent_name") or case.get("decedent_name", "")
         petitioner = detail.get("petitioner_name", "")
         petitioner_addr = detail.get("petitioner_physical") or detail.get("petitioner_mailing") or ""
-        file_date = case.get("file_date", "")
 
         prop = {}
         if address:
@@ -359,7 +363,7 @@ def run_scraper(start_date, end_date):
             "owner": owner,
             "phone": "",
             "mail": petitioner_addr,
-            "filed": file_date,
+            "filed": case.get("file_date", ""),
             "status": "New",
             "assigned": "Mike",
             "followup": "",
